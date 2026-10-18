@@ -22,6 +22,16 @@ outb(unsigned short port, unsigned char data)
   asm volatile("outb %0, %1" : : "a" (data), "Nd" (port));
 }
 
+/*
+static inline unsigned char
+inb(unsigned short port)
+{
+  unsigned char data;
+  asm volatile("inb %1, %0" : "=a" (data) : "Nd" (port));
+  return data;
+}
+*/
+
 // Called from the trampoline (helloguestasm.S) once the CPU is in
 // 64-bit mode with a stack. When it returns, the trampoline halts.
 void
@@ -35,4 +45,8 @@ guestmain(void)
   // we skip that and just write.
   for(s = "Hello from a VT-x guest\n"; *s; s++)
     outb(COM1, *s);
+/*
+	outb(COM1, '0' + (inb(0x3F8 + 5) >> 5));
+	outb(COM1, '0' + (inb(0x1ff)));
+*/
 }

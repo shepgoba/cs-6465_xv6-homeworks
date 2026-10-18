@@ -123,7 +123,7 @@ static inline int
 vmxon(uint64 pa)
 {
   uchar fail;
-  asm volatile("vmxon %1; setna %0" : "=q" (fail) : "m" (pa) : "cc", "memory");
+  asm volatile("vmxon %1\n\t setna %0" : "=q" (fail) : "m" (pa) : "cc", "memory");
   return fail ? -1 : 0;
 }
 
@@ -137,7 +137,7 @@ static inline int
 vmclear(uint64 pa)
 {
   uchar fail;
-  asm volatile("vmclear %1; setna %0" : "=q" (fail) : "m" (pa) : "cc", "memory");
+  asm volatile("vmclear %1\n\t setna %0" : "=q" (fail) : "m" (pa) : "cc", "memory");
   return fail ? -1 : 0;
 }
 
@@ -149,7 +149,7 @@ static inline int
 vmptrld(uint64 pa)
 {
   uchar fail;
-  asm volatile("vmptrld %1; setna %0" : "=q" (fail) : "m" (pa) : "cc", "memory");
+  asm volatile("vmptrld %1\n\t setna %0" : "=q" (fail) : "m" (pa) : "cc", "memory");
   return fail ? -1 : 0;
 }
 
@@ -177,7 +177,7 @@ static void
 vmwrite(uint64 field, uint64 val)
 {
   uchar fail;
-  asm volatile("vmwrite %2, %1; setna %0" : "=q" (fail) : "r" (field), "r" (val) : "cc");
+  asm volatile("vmwrite %2, %1\n\t setna %0" : "=q" (fail) : "r" (field), "r" (val) : "cc");
   if(fail){
     cprintf("vmwrite 0x%x = 0x%x: error %d\n", field, val,
             (int)vmread(VM_INSTRUCTION_ERROR));
@@ -196,7 +196,7 @@ invept(uint64 type, uint64 eptp)
 {
   struct { uint64 eptp, reserved; } desc = { eptp, 0 };
   uchar fail;
-  asm volatile("invept %1, %2; setna %0" : "=q" (fail) : "m" (desc), "r" (type)
+  asm volatile("invept %1, %2\n\t setna %0" : "=q" (fail) : "m" (desc), "r" (type)
                : "cc", "memory");
   return fail ? -1 : 0;
 }
@@ -210,7 +210,55 @@ invept(uint64 type, uint64 eptp)
 void
 vmxinit(void)
 {
-  /* HW1 part 1: write this function; see HW1.md. */
+  uint a, b, c, d;
+  uint64 fc, cr0, cr4;
+  int id = cpuid();
+  char *region;
+
+  /* CPUID.1:ECX.VMX[bit 5] says whether the CPU has VT-x at all. */
+  cpuid_insn(1, &a, &b, &c, &d);
+  if (!(c & CPUID1_ECX_VMX)) {
+    cprintf("cpu%d: no VMX support\n", id);
+    return;
+  }
+
+  fc = rdmsr(MSR_IA32_FEATURE_CONTROL);
+  if(!(fc & FEATURE_CONTROL_LOCKED)){
+    fc |= FEATURE_CONTROL_LOCKED | FEATURE_CONTROL_VMXON_OUTSIDE_SMX;
+    wrmsr(MSR_IA32_FEATURE_CONTROL, fc);
+  }
+
+  if(!(fc & FEATURE_CONTROL_VMXON_OUTSIDE_SMX)){
+    cprintf("cpu%d: VMX disabled by firmware\n", id);
+    return;
+  }
+
+
+  cr0 = rcr0();
+  cr0 |= rdmsr(MSR_IA32_VMX_CR0_FIXED0);
+  cr0 &= rdmsr(MSR_IA32_VMX_CR0_FIXED1);
+  lcr0(cr0);
+  cr4 = rcr4() | CR4_VMXE;
+  cr4 |= rdmsr(MSR_IA32_VMX_CR4_FIXED0);
+  cr4 &= rdmsr(MSR_IA32_VMX_CR4_FIXED1);
+  lcr4(cr4);
+
+  vmcs_revision = rdmsr(MSR_IA32_VMX_BASIC) & 0x7FFFFFFF;
+  if ((region = kalloc()) == 0){
+    cprintf("cpu%d: no memory for the VMXON region\n", id);
+    return;
+  }
+  memset(region, 0, PGSIZE);
+  *(uint *)region = vmcs_revision;
+
+  /* VMXON takes the region's physical address. */
+  if (vmxon(V2P(region)) < 0) {
+    cprintf("cpu%d: vmxon failed\n", id);
+    kfree(region);
+    return;
+  }
+  cpus[id].vmx_ok = 1;
+  cprintf("cpu%d: VMX enabled\n", id);
 }
 
 /*
@@ -233,8 +281,18 @@ vmxinit(void)
 static int
 adjustctl(uint msr, uint want, uint *ctl)
 {
-  /* HW1 part 3: write this function; see HW1.md. */
-  return -1;
+   uint64 cap = rdmsr(msr);
+  /* Force on the required bits, then mask off unsupported ones. */
+  uint v = (want | (uint)cap) & (uint)(cap >> 32);
+
+  /* If masking dropped a bit we asked for, the CPU can't do it. */
+  if((v & want) != want){
+    cprintf("vmx: controls 0x%x unsupported (MSR 0x%x)\n",
+            (uint64)(want & ~v), (uint64)msr);
+    return -1;
+  }
+  *ctl = v;
+  return 0;
 }
 
 /*
@@ -269,6 +327,134 @@ static int
 vmcsinit(struct vm *vm)
 {
   /* HW1 part 3: write this function; see HW1.md. */
+	uint pin, cpu, cpu2, exitctl, entryctl;
+  /*
+   * IA32_VMX_BASIC bit 55 says that the "TRUE" capability MSRs exist.
+   * They report the real default-1 controls; the older MSRs force
+   * some bits (like CR3-load exiting) to 1 on old CPUs.
+   */
+  int t = (rdmsr(MSR_IA32_VMX_BASIC) & VMX_BASIC_TRUE_CTLS) != 0;
+  uint64 cr0, cr4;
+  int seg;
+
+  if (adjustctl(t ? MSR_IA32_VMX_TRUE_PINBASED_CTLS : MSR_IA32_VMX_PINBASED_CTLS,
+               /*
+                * Pin-based: exit on external interrupts (so the host
+                * kernel, not the guest, handles them) and on NMIs.
+                */
+               PIN_EXTINT_EXITING | PIN_NMI_EXITING, &pin) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_PROCBASED_CTLS : MSR_IA32_VMX_PROCBASED_CTLS,
+               /*
+                * Primary processor-based: exit on HLT, exit on every
+                * IN/OUT (no I/O bitmap), and enable the secondary
+                * controls word, which holds EPT and unrestricted guest.
+                */
+               CPU_HLT_EXITING | CPU_UNCOND_IO_EXITING | CPU_ACTIVATE_SECONDARY,
+               &cpu) < 0 ||
+     adjustctl(MSR_IA32_VMX_PROCBASED_CTLS2,
+               /*
+                * Secondary: nested paging via EPT, and unrestricted
+                * guest (lets the guest run with CR0.PE/PG off, i.e.
+                * real or paging-less protected mode).  Unrestricted
+                * guest requires EPT.
+                */
+               CPU2_ENABLE_EPT | CPU2_UNRESTRICTED_GUEST, &cpu2) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_EXIT_CTLS : MSR_IA32_VMX_EXIT_CTLS,
+               /*
+                * Exit: the host is a 64-bit kernel, so the processor
+                * must return to 64-bit mode (HOST_ADDR_SPACE_SIZE);
+                * save the guest's EFER into the VMCS on exit and load
+                * the host's EFER from the VMCS.  "Acknowledge
+                * interrupt on exit" is deliberately not set.
+                */
+               EXIT_HOST_ADDR_SPACE_SIZE | EXIT_SAVE_IA32_EFER |
+               EXIT_LOAD_IA32_EFER, &exitctl) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_ENTRY_CTLS : MSR_IA32_VMX_ENTRY_CTLS,
+               /*
+                * Entry: load the guest's EFER from the VMCS.  The
+                * "IA-32e mode guest" bit is set later, in vmrun(),
+                * according to the guest's EFER.LMA.
+                */
+               ENTRY_LOAD_IA32_EFER, &entryctl) < 0)
+    return -1;
+
+	if (cpu & (CPU_CR3_LOAD_EXITING | CPU_CR3_STORE_EXITING |
+            CPU_USE_IO_BITMAPS | CPU_USE_MSR_BITMAPS)){
+    cprintf("vmx: CPU forces unwanted exiting controls 0x%x\n", (uint64)cpu);
+    return -1;
+  }
+
+	vmwrite(PIN_BASED_VM_EXEC_CONTROL, pin);
+  vmwrite(CPU_BASED_VM_EXEC_CONTROL, cpu);
+  vmwrite(SECONDARY_VM_EXEC_CONTROL, cpu2);
+  vmwrite(VM_EXIT_CONTROLS, exitctl);
+  vmwrite(VM_ENTRY_CONTROLS, entryctl);
+
+
+vmwrite(EXCEPTION_BITMAP, 0xFFFFFFFF);  /* no guest IDT: exit on everything */
+
+  vmwrite(PAGE_FAULT_ERROR_CODE_MASK, 0);
+  vmwrite(PAGE_FAULT_ERROR_CODE_MATCH, 0);
+
+	  /* No CR3-target values (they would let some MOV to CR3 skip exiting). */
+  vmwrite(CR3_TARGET_COUNT, 0);
+  /* No MSR save/load lists on exit or entry. */
+  vmwrite(VM_EXIT_MSR_STORE_COUNT, 0);
+  vmwrite(VM_EXIT_MSR_LOAD_COUNT, 0);
+  vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 0);
+  /* Don't inject any event (interrupt/exception) on VM entry. */
+  vmwrite(VM_ENTRY_INTR_INFO_FIELD, 0);
+  /* Tell the processor where this guest's EPT lives (SDM 27.6.11). */
+  vmwrite(EPT_POINTER, vm->eptp);
+
+	vmwrite(CR0_GUEST_HOST_MASK, 0);
+  vmwrite(CR0_READ_SHADOW, 0);
+  vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE);
+  vmwrite(CR4_READ_SHADOW, 0);
+
+  vmwrite(HOST_RIP, (uint64)vmx_exit);
+
+  cr0 = CR0_PE | CR0_ET | CR0_NE;
+  cr0 |= rdmsr(MSR_IA32_VMX_CR0_FIXED0) & ~(uint64)(CR0_PE | CR0_PG);
+  cr0 &= rdmsr(MSR_IA32_VMX_CR0_FIXED1);
+
+	cr4 = CR4_VMXE | rdmsr(MSR_IA32_VMX_CR4_FIXED0);
+  cr4 &= rdmsr(MSR_IA32_VMX_CR4_FIXED1);
+  vmwrite(GUEST_CR0, cr0);
+  /* CR3 is irrelevant until the guest turns paging on. */
+  vmwrite(GUEST_CR3, 0);
+  vmwrite(GUEST_CR4, cr4);
+  /* DR7 reset value (bit 10 is reserved-1): no hardware breakpoints. */
+  vmwrite(GUEST_DR7, 0x400);
+
+	guestseg(SEG_CS, 0x08, 0, 0xFFFFFFFF, AR_CODE32);
+  for(seg = SEG_ES; seg <= SEG_GS; seg++)
+    if(seg != SEG_CS)
+      guestseg(seg, 0x10, 0, 0xFFFFFFFF, AR_DATA32);
+  /*
+   * LDTR is marked unusable (as after reset, no LDT), and TR must be
+   * valid for VM entry: a busy TSS (32-bit, limit 0xFFFF) is the
+   * simplest value that passes the guest-state checks of SDM 29.3.1.2.
+   */
+  guestseg(SEG_LDTR, 0, 0, 0, AR_UNUSABLE);
+  guestseg(SEG_TR, 0, 0, 0xFFFF, AR_TSS32_BUSY);
+
+	vmwrite(GUEST_GDTR_BASE, 0);
+  vmwrite(GUEST_GDTR_LIMIT, 0);
+  vmwrite(GUEST_IDTR_BASE, 0);
+  vmwrite(GUEST_IDTR_LIMIT, 0);
+
+  vmwrite(GUEST_INTERRUPTIBILITY_INFO, 0);
+  vmwrite(GUEST_ACTIVITY_STATE, 0);
+  vmwrite(GUEST_PENDING_DBG_EXCEPTIONS, 0);
+  /* No shadow VMCS: the link pointer must be all ones. */
+  vmwrite(VMCS_LINK_POINTER, ~0ULL);
+  /* Remaining MSR-backed guest state: all zero. */
+  vmwrite(GUEST_IA32_DEBUGCTL, 0);
+  vmwrite(GUEST_SYSENTER_CS, 0);
+  vmwrite(GUEST_SYSENTER_ESP, 0);
+  vmwrite(GUEST_SYSENTER_EIP, 0);
+
   return 0;
 }
 
@@ -285,6 +471,33 @@ static void
 vmxhoststate(void)
 {
   /* HW1 part 4: write this function; see HW1.md. */
+	struct cpu *c = mycpu();
+
+  /* Control registers: the kernel's own, so exits land in the kernel. */
+  vmwrite(HOST_CR0, rcr0());
+  /* The current process's page table; the kernel half is shared. */
+  vmwrite(HOST_CR3, rcr3());
+  vmwrite(HOST_CR4, rcr4());
+
+	vmwrite(HOST_CS_SELECTOR, SEG_KCODE << 3);
+  vmwrite(HOST_SS_SELECTOR, 0);
+  vmwrite(HOST_DS_SELECTOR, 0);
+  vmwrite(HOST_ES_SELECTOR, 0);
+  vmwrite(HOST_FS_SELECTOR, 0);
+  vmwrite(HOST_GS_SELECTOR, 0);
+  vmwrite(HOST_TR_SELECTOR, SEG_TSS << 3);
+
+	vmwrite(HOST_FS_BASE, rdmsr(MSR_IA32_FS_BASE));
+  vmwrite(HOST_GS_BASE, rdmsr(MSR_IA32_GS_BASE));
+  vmwrite(HOST_TR_BASE, (uint64)&c->ts);
+  vmwrite(HOST_GDTR_BASE, (uint64)c->gdt);
+  vmwrite(HOST_IDTR_BASE, (uint64)idt);
+
+	vmwrite(HOST_IA32_SYSENTER_CS, 0);
+  vmwrite(HOST_IA32_SYSENTER_ESP, 0);
+  vmwrite(HOST_IA32_SYSENTER_EIP, 0);
+  /* Loaded on exit because we set EXIT_LOAD_IA32_EFER in vmcsinit(). */
+  vmwrite(HOST_IA32_EFER, rdmsr(EFER_MSR));
 }
 
 /*
@@ -303,8 +516,38 @@ vmxhoststate(void)
 static uint64*
 eptwalk(uint64 *pml4, uint64 gpa, int alloc)
 {
-  /* HW1 part 2: write this function; see HW1.md. */
-  return 0;
+  uint64 *table = pml4, *e;
+  char *next;
+  int level;
+  int index;
+
+  /*
+   * Walk levels 3 (PML4), 2 (PDPT) and 1 (PD); level 0, the page
+   * table, is indexed after the loop.  Index = 9 bits starting at
+   * bit 12 + 9*level.
+   */
+  for(level = 3; level > 0; level--){
+    e = &table[(gpa >> (12 + 9*level)) & 0x1FF];
+    if(*e & EPT_RWX){
+      /* Present: descend.  The entry holds a physical address. */
+      table = (uint64*)P2V(EPT_ADDR(*e));
+    } else {
+      if(!alloc || (next = kalloc()) == 0)
+        return 0;
+      /* kalloc() doesn't zero; a non-zero junk entry would look present. */
+      memset(next, 0, PGSIZE);
+      /*
+       * Non-leaf entries grant R/W/X so that only the leaf entry
+       * restricts permissions (the effective permission is the AND
+       * over all levels).
+       */
+      *e = V2P(next) | EPT_RWX;
+      table = (uint64*)next;
+    }
+  }
+
+  index = (gpa >> 12) & 0x1ff;
+  return &table[index];
 }
 
 /*
@@ -381,7 +624,97 @@ vmcreate(char *image, int len, int memsz)
   char *mem;
   int id, n, off, r;
 
-  /* HW1 part 2: write this function; see HW1.md. */
+  if (memsz <= 0 || memsz > VM_MAXMEM || len < 0 || VM_LOAD_ADDR + len > memsz)
+   	return -1;
+
+  pushcli();
+  r = mycpu()->vmx_ok;
+  popcli();
+  if (!r)
+    return -1;
+
+	need = EPT_CAP_WALK_4 | EPT_CAP_MEMTYPE_WB | EPT_CAP_INVEPT | EPT_CAP_INVEPT_SINGLE;
+  if ((rdmsr(MSR_IA32_VMX_EPT_VPID_CAP) & need) != need){
+    cprintf("vmx: CPU lacks required EPT features\n");
+    return -1;
+  }
+
+  /* Claim a free VM slot under the lock. */
+  acquire(&vms.lock);
+  for(id = 0; id < NVM; id++)
+    if(!vms.vm[id].used)
+      break;
+  if(id == NVM){
+    release(&vms.lock);
+    return -1;
+  }
+  vm = &vms.vm[id];
+  /* Zero everything: null pointers (for vmfree), flushed = 0, regs = 0. */
+  memset(vm, 0, sizeof(*vm));
+  vm->used = 1;
+  vm->owner = myproc();
+  release(&vms.lock);
+
+  vm->memsz = PGROUNDUP(memsz);
+  vm->rflags = 0x2;  /* bit 1 is reserved and must be 1 */
+
+	if ((vm->vmcs = kalloc()) == 0)
+    goto bad;
+  memset(vm->vmcs, 0, PGSIZE);
+
+	  /* The EPT PML4: must be zeroed, since zero entries mean "not present". */
+  if((vm->ept = (uint64*)kalloc()) == 0)
+    goto bad;
+  memset(vm->ept, 0, PGSIZE);
+  /*
+   * EPT pointer (SDM 27.6.11): physical address of the PML4 in the
+   * high bits, EPT paging-structure memory type in bits 2:0 (6 =
+   * write-back), and page-walk length minus one in bits 5:3 (3 = a
+   * 4-level walk).
+   */
+  vm->eptp = V2P(vm->ept) | EPTP_WALK_4 | EPTP_MEMTYPE_WB;
+
+	for(gpa = 0; gpa < vm->memsz; gpa += PGSIZE){
+    if((pte = eptwalk(vm->ept, gpa, 1)) == 0 || (mem = kalloc()) == 0)
+      goto bad;
+    memset(mem, 0, PGSIZE);
+    *pte = V2P(mem) | EPT_RWX | EPT_MEMTYPE_WB;
+  }
+
+	for(off = 0; off < len; off += n){
+    gpa = VM_LOAD_ADDR + off;
+    /* Bytes left in this guest page, capped by the bytes left to copy. */
+    n = PGSIZE - gpa % PGSIZE;
+    if(n > len - off)
+      n = len - off;
+    /* Already populated above (the size check guarantees it). */
+    pte = eptwalk(vm->ept, gpa, 0);
+    memmove((char*)P2V(EPT_ADDR(*pte)) + gpa % PGSIZE, image + off, n);
+  }
+
+  /*cprintf("vmcreate: vm %d, memsz %x, eptp %x\n", id, vm->memsz, vm->eptp);
+  pte = eptwalk(vm->ept, VM_LOAD_ADDR, 0);
+  cprintf("image word %x, guest word %x\n", (uint64)*(uint*)image,
+          (uint64)*(uint*)P2V(EPT_ADDR(*pte)));*/
+	*(uint*)vm->vmcs = vmcs_revision;
+	pushcli();
+	if(!mycpu()->vmx_ok || vmclear(V2P(vm->vmcs)) < 0 || vmptrld(V2P(vm->vmcs)) < 0){
+		popcli();
+		goto bad;
+	}
+	r = vmcsinit(vm);
+	/*
+		* Always VMCLEAR when done, even on error, so no CPU holds the
+		* VMCS cached and it can be freed or loaded elsewhere.
+		*/
+	vmclear(V2P(vm->vmcs));
+	popcli();
+	if(r < 0)
+		goto bad;
+	return id;
+
+bad:
+  vmfree(vm);
   return -1;
 }
 
@@ -397,8 +730,24 @@ vmsetreg(int id, int reg, uint64 val)
 {
   struct vm *vm;
 
-  /* HW1 part 5: write this function; see HW1.md. */
-  return -1;
+  if((vm = getvm(id)) == 0 || reg < 0 || reg >= VMREG_NREGS)
+    return -1;
+  switch(reg){
+  case VMREG_RSP:
+    vm->rsp = val;
+    break;
+  case VMREG_RIP:
+    vm->rip = val;
+    break;
+  case VMREG_RFLAGS:
+    /* RFLAGS bit 1 always reads as 1; VM entry checks for it. */
+    vm->rflags = val | 0x2;
+    break;
+  default:
+    /* VMREG_RAX..VMREG_R15 follow the layout of struct guestregs. */
+    ((uint64*)&vm->regs)[reg] = val;
+  }
+  return 0;
 }
 
 /*
@@ -414,8 +763,23 @@ vmgetreg(int id, int reg, uint64 *val)
 {
   struct vm *vm;
 
-  /* HW1 part 5: write this function; see HW1.md. */
-  return -1;
+ 	if((vm = getvm(id)) == 0 || reg < 0 || reg >= VMREG_NREGS)
+    return -1;
+  switch(reg){
+  case VMREG_RSP:
+    *val = vm->rsp;
+    break;
+  case VMREG_RIP:
+    *val = vm->rip;
+    break;
+  case VMREG_RFLAGS:
+    *val = vm->rflags;
+    break;
+  default:
+    /* VMREG_RAX..VMREG_R15 follow the layout of struct guestregs. */
+    *val = ((uint64*)&vm->regs)[reg];
+  }
+  return 0;
 }
 
 /* Mask for the low `size` bytes (1, 2 or 4) of an I/O access. */
@@ -435,8 +799,23 @@ iomask(int size)
 static int
 vmxmsr(struct vm *vm, int write)
 {
-  /* HW1 part 5: write this function; see HW1.md. */
-  return -1;
+  uint64 val;
+
+  if((uint)vm->regs.rcx != EFER_MSR)
+    return -1;
+  if(write){
+    val = (vm->regs.rdx << 32) | (uint)vm->regs.rax;
+    /*
+     * The processor sets LMA itself when the guest enables paging
+     * with LME set; LMA is read-only to software, so preserve ours.
+     */
+    vm->efer = (val & ~(uint64)EFER_LMA) | (vm->efer & EFER_LMA);
+  } else {
+    /* Return the saved value; writes to EAX/EDX zero the upper halves. */
+    vm->regs.rax = (uint)vm->efer;
+    vm->regs.rdx = vm->efer >> 32;
+  }
+  return 0;
 }
 
 /*
@@ -450,8 +829,60 @@ vmxmsr(struct vm *vm, int write)
 static int
 vmxhandle(struct vm *vm, struct vmexit *e, uint inslen)
 {
-  /* HW1 part 5: write this function; see HW1.md. */
-  return 0;
+	
+	switch(e->reason){
+  case EXIT_EXTERNAL_INTR:
+    /*
+     * The interrupt is still pending in the local APIC (we don't
+     * acknowledge it on exit), so the host took it at popcli().
+     * Nothing to do but resume the guest.
+     */
+    return 1;
+  case EXIT_EXCEPTION_NMI:
+    /*
+     * This reason covers both guest exceptions (which we send to user
+     * space for debugging) and NMIs, told apart by the interruption
+     * type in the exit interruption-information field.
+     */
+    if(INTR_INFO_TYPE(e->intrinfo) == INTR_TYPE_NMI)
+      return 1;  /* a host NMI; xv6 has no use for it */
+    return 0;
+
+	case EXIT_RDMSR:
+  case EXIT_WRMSR:
+    /*
+     * Emulate, then advance RIP past the RDMSR/WRMSR (the processor
+     * does not, since it was an exit rather than a completed
+     * instruction).  Unsupported MSRs go to user space.
+     */
+    if(vmxmsr(vm, e->reason == EXIT_WRMSR) < 0)
+      return 0;
+    vm->rip += inslen;
+    return 1;
+
+	case EXIT_HLT:
+    /* Skip the HLT so a later vmrun() continues after it. */
+    vm->rip += inslen;
+    return 0;
+
+	case EXIT_IO:
+    /* ... your code ... */
+		uint64 qual = e->qual;
+		e->io.port = (qual >> 16) & 0xffff;
+		e->io.size = qual & 3;
+		e->io.in = (qual >> 3) & 1;
+
+		uint64 guest_rax = vm->regs.rax;
+
+		e->io.data = guest_rax & iomask(e->io.size);
+		
+
+		vm->rip += inslen;
+    return 0;
+	default:
+		/* Anything else (EPT violation, CPUID, triple fault, ...). */
+		return 0;
+	}
 }
 
 /*
@@ -566,8 +997,8 @@ vmrun(int id, struct vmexit *ue)
       e.rip = vm->rip;
     }
     /* Release the VMCS and turn interrupts back on (HW1 part 5, Step 8). */
+	vmclear(V2P(vm->vmcs));
     popcli();  /* a pending host interrupt is delivered here */
-    vmclear(V2P(vm->vmcs));
 
     /*
      * Failed entries and VMLAUNCH failures always go to user space.

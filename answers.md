@@ -16,7 +16,7 @@ Fill in this file and hand it in with your code. Replace each
 > In Step 1, why does the function `return` when VMX is missing instead
 > of calling `panic()`?
 
-**Answer:** (your answer)
+**Answer:** So the operating system can still boot/function even without VMX. VMX isn't needed for normal OS functionality.
 
 ### Question 1.2
 
@@ -31,14 +31,14 @@ Fill in this file and hand it in with your code. Replace each
 > In Step 3, what would happen if we skipped `lcr4(cr4)` and went
 > straight to `VMXON`?
 
-**Answer:** (your answer)
+**Answer:** We get a kernel panic due to undefined opcode exception. The processor relies on CR4 being set correctly to execute VMX instructions.
 
 ### Question 1.4
 
 > In Step 4, why does each CPU need its own VMXON region? What could go
 > wrong if all CPUs shared one?
 
-**Answer:** (your answer)
+**Answer:** Because each CPU needs to track its own state for VMX operation. If each CPU shared one, VMs would race on the same data (if 2 CPUs run a VM at the same time) and would almost certainly crash.
 
 ## Part 2: Creating a VM, its memory, and the EPT
 
