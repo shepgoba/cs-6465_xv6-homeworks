@@ -61,10 +61,10 @@ completein(int vm, int size, uint val)
 
 
 	if (size == 1) {
-		uint64 new_rax = (rax & 0xffffffffffffff00) | val;
+		uint64 new_rax = (rax & 0xffffffffffffff00) | (val & 0xff);
 		vmsetreg(vm, VMREG_RAX, new_rax);
 	} else if (size == 2) {
-		uint64 new_rax = (rax & 0xffffffffffff0000) | val;
+		uint64 new_rax = (rax & 0xffffffffffff0000) | (val & 0xffff);
 		vmsetreg(vm, VMREG_RAX, new_rax);
 	} else {
 		// size = 4
